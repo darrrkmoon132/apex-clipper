@@ -4,12 +4,15 @@ import glob
 import zipfile
 import subprocess
 import logging
+import signal
+from contextlib import contextmanager
 from typing import Generator, List, Tuple, Optional
 
 import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 import gradio as gr
 import yt_dlp
+from yt_dlp.utils import DownloadError, ExtractorError
 
 # ====================== ЛОГИРОВАНИЕ ======================
 logging.basicConfig(
@@ -37,6 +40,23 @@ KEYWORDS = [
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+# ====================== ТАЙМАУТ ======================
+class TimeoutException(Exception):
+    pass
+
+@contextmanager
+def time_limit(seconds: int):
+    def signal_handler(signum, frame):
+        raise TimeoutException(f"Превышен таймаут {seconds} сек")
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+
+
+# ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def get_video_info(url: str) -> Tuple[float, Optional[str], str]:
     ydl_opts = {
         "quiet": True,
@@ -44,32 +64,48 @@ def get_video_info(url: str) -> Tuple[float, Optional[str], str]:
         "skip_download": True,
         "format": "best[height<=1080]/best",
         "noplaylist": True,
+        "socket_timeout": 25,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "file_access_retries": 3,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        duration = float(info.get("duration") or 0)
-        title = str(info.get("title") or "vod")[:60]
 
-        stream_url = None
-        formats = info.get("formats") or []
-        preferred = []
-        for f in formats:
-            if f.get("vcodec") in (None, "none"):
-                continue
-            if not f.get("url"):
-                continue
-            height = f.get("height") or 0
-            ext = f.get("ext") or ""
-            preferred.append((height, ext == "mp4", f["url"]))
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-        if preferred:
-            preferred.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            stream_url = preferred[0][2]
+            duration = float(info.get("duration") or 0)
+            title = str(info.get("title") or "vod")[:60]
 
-        if not stream_url:
-            stream_url = info.get("url")
+            stream_url = None
+            formats = info.get("formats") or []
 
-        return duration, stream_url, title
+            preferred = []
+            for f in formats:
+                if f.get("vcodec") in (None, "none"):
+                    continue
+                if not f.get("url"):
+                    continue
+                height = f.get("height") or 0
+                ext = (f.get("ext") or "").lower()
+                preferred.append((height, ext == "mp4", f["url"]))
+
+            if preferred:
+                preferred.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                stream_url = preferred[0][2]
+
+            if not stream_url:
+                stream_url = info.get("url")
+
+            return duration, stream_url, title
+
+    except DownloadError as e:
+        raise Exception(f"Ошибка загрузки (сеть/Twitch): {str(e)[:200]}")
+    except ExtractorError as e:
+        raise Exception(f"Ошибка извлечения данных: {str(e)[:200]}")
+    except Exception as e:
+        raise Exception(f"Неизвестная ошибка yt-dlp: {str(e)[:200]}")
 
 
 def sec_to_time(seconds: float) -> str:
@@ -123,6 +159,7 @@ def clear_output_dir():
             pass
 
 
+# ====================== ГЛАВНАЯ ФУНКЦИЯ ======================
 def process_vod(
     url: str,
     pre_sec: int,
@@ -135,14 +172,36 @@ def process_vod(
         return
 
     clear_output_dir()
+
     progress(0.0, desc="Получаем информацию о VOD...")
-    yield "🔍 Получаем информацию о VOD...", []
+    yield "🔍 Получаем информацию о VOD...\n(максимум 70 секунд, потом таймаут)", []
 
     try:
-        duration, stream_url, title = get_video_info(url)
+        with time_limit(70):
+            duration, stream_url, title = get_video_info(url)
+
+    except TimeoutException:
+        yield (
+            "❌ Таймаут (70 сек).\n"
+            "Twitch слишком долго отвечает с серверов Render.\n"
+            "Попробуй другой VOD или повтори позже."
+        ), []
+        return
+
     except Exception as e:
-        logger.exception("Ошибка yt-dlp")
-        yield f"❌ Ошибка получения информации: {e}", []
+        error_msg = str(e)
+        logger.error(f"Ошибка получения информации: {error_msg}")
+
+        if "Unable to download" in error_msg or "HTTP Error" in error_msg:
+            user_msg = "❌ Проблемы с сетью или Twitch временно недоступен."
+        elif "Private video" in error_msg or "login" in error_msg.lower():
+            user_msg = "❌ VOD приватный или требует авторизации."
+        elif "not available" in error_msg.lower() or "404" in error_msg:
+            user_msg = "❌ VOD не найден или удалён."
+        else:
+            user_msg = f"❌ Ошибка: {error_msg}"
+
+        yield user_msg, []
         return
 
     if not stream_url:
