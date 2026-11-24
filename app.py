@@ -4,8 +4,7 @@ import glob
 import zipfile
 import subprocess
 import logging
-import signal
-from contextlib import contextmanager
+import threading
 from typing import Generator, List, Tuple, Optional
 
 import numpy as np
@@ -23,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger("apex-clipper")
 
 # ====================== НАСТРОЙКИ ======================
-CROP = (600, 200, 660, 620)          # width, height, x, y
+CROP = (600, 200, 660, 620)
 FPS = 3
 DEBOUNCE = 4.0
 MERGE_GAP = 20.0
@@ -40,20 +39,37 @@ KEYWORDS = [
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ====================== ТАЙМАУТ ======================
+# ====================== ТАЙМАУТ ЧЕРЕЗ ПОТОК ======================
 class TimeoutException(Exception):
     pass
 
-@contextmanager
-def time_limit(seconds: int):
-    def signal_handler(signum, frame):
-        raise TimeoutException(f"Превышен таймаут {seconds} сек")
-    signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
+
+def run_with_timeout(func, args=(), kwargs=None, timeout=70):
+    """Запускает функцию с таймаутом (работает в любом потоке)."""
+    if kwargs is None:
+        kwargs = {}
+    
+    result = []
+    exception = []
+
+    def target():
+        try:
+            result.append(func(*args, **kwargs))
+        except Exception as e:
+            exception.append(e)
+
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout)
+
+    if thread.is_alive():
+        raise TimeoutException(f"Превышен таймаут {timeout} сек")
+    
+    if exception:
+        raise exception[0]
+    
+    return result[0]
 
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
@@ -177,8 +193,11 @@ def process_vod(
     yield "🔍 Получаем информацию о VOD...\n(максимум 70 секунд, потом таймаут)", []
 
     try:
-        with time_limit(70):
-            duration, stream_url, title = get_video_info(url)
+        duration, stream_url, title = run_with_timeout(
+            get_video_info,
+            args=(url,),
+            timeout=70
+        )
 
     except TimeoutException:
         yield (
